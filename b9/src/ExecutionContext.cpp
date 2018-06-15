@@ -1,4 +1,5 @@
 #include <b9/ExecutionContext.hpp>
+#include <b9/JitHelpers.hpp>
 #include <b9/VirtualMachine.hpp>
 #include <b9/compiler/Compiler.hpp>
 
@@ -6,9 +7,9 @@
 #include "Jit.hpp"
 
 #include <OMR/Om/ArrayOperations.hpp>
-#include <OMR/Om/ShapeOperations.hpp>
 #include <OMR/Om/ObjectOperations.hpp>
 #include <OMR/Om/RootRef.hpp>
+#include <OMR/Om/ShapeOperations.hpp>
 #include <OMR/Om/Value.hpp>
 
 #include <sys/time.h>
@@ -22,18 +23,22 @@
 
 namespace b9 {
 
-ExecutionContext::ExecutionContext(VirtualMachine &virtualMachine,
-                                   const Config &cfg)
+ExecutionContext::ExecutionContext(VirtualMachine& virtualMachine,
+                                   const Config& cfg)
     : omContext_(virtualMachine.memoryManager()),
       virtualMachine_(&virtualMachine),
-      cfg_(&cfg) {
+      cfg_(&cfg),
+      fn_(0),
+      ip_(0),
+      bp_(stack().top()),
+      continue_(true) {
   omContext().userMarkingFns().push_back(
-      [this](Om::MarkingVisitor &v) { this->visit(v); });
+      [this](Om::MarkingVisitor& v) { this->visit(v); });
 }
 
 void ExecutionContext::reset() {
+  continue_ = true;
   stack_.reset();
-  programCounter_ = 0;
 }
 
 Om::Value ExecutionContext::callJitFunction(JitFunction jitFunction,
@@ -75,37 +80,53 @@ Om::Value ExecutionContext::callJitFunction(JitFunction jitFunction,
   return Om::Value(Om::AS_RAW, result);
 }
 
-StackElement ExecutionContext::interpret(const std::size_t functionIndex) {
-  auto function = virtualMachine_->getFunction(functionIndex);
-  auto argsCount = function->nargs;
-  auto jitFunction = virtualMachine_->getJitAddress(functionIndex);
+StackElement ExecutionContext::run(std::size_t target,
+                                   std::vector<StackElement> arguments) {
+  auto& callee = getFunction(target);
+  assert(callee.nargs == arguments.size());
 
-  if (jitFunction) {
-    return callJitFunction(jitFunction, argsCount);
+  reset();
+
+  for (auto arg : arguments) {
+    stack_.push(arg);
   }
 
-  // interpret the method otherwise
-  const Instruction *instructionPointer = function->instructions.data();
+  enterCall(target, CallerType::OUTERMOST);
+  interpret();
+  return stack_.pop();
+}
 
-  StackElement *args = stack_.top() - function->nargs;
-  stack_.pushn(function->nregs);
+StackElement ExecutionContext::run(std::size_t target) {
+  auto& callee = getFunction(target);
+  assert(callee.nargs == 0);
 
-  while (*instructionPointer != END_SECTION) {
-    switch (instructionPointer->opCode()) {
+  reset();
+
+  enterCall(target);
+  interpret();
+  return stack_.pop();
+}
+
+void ExecutionContext::interpret() {
+  while (continue_) {
+    assert(ip_ != 0x00 || ip_ != (Instruction*)0x04);
+
+    if (cfg_->debug) {
+      printTrace(std::cerr, getFunction(fn_), ip_) << std::endl;
+    }
+
+    switch (ip_->opCode()) {
       case OpCode::FUNCTION_CALL:
-        doFunctionCall(instructionPointer->immediate());
+        doFunctionCall();
         break;
-      case OpCode::FUNCTION_RETURN: {
-        auto result = stack_.pop();
-        stack_.restore(args);
-        return result;
+      case OpCode::FUNCTION_RETURN:
+        doFunctionReturn();
         break;
-      }
       case OpCode::PRIMITIVE_CALL:
-        doPrimitiveCall(instructionPointer->immediate());
+        doPrimitiveCall();
         break;
       case OpCode::JMP:
-        instructionPointer += instructionPointer->immediate();
+        doJmp();
         break;
       case OpCode::DUPLICATE:
         doDuplicate();
@@ -114,11 +135,10 @@ StackElement ExecutionContext::interpret(const std::size_t functionIndex) {
         doDrop();
         break;
       case OpCode::PUSH_FROM_VAR:
-        doPushFromVar(args, instructionPointer->immediate());
+        doPushFromVar();
         break;
       case OpCode::POP_INTO_VAR:
-        // TODO bad name, push or pop?
-        doPushIntoVar(args, instructionPointer->immediate());
+        doPopIntoVar();
         break;
       case OpCode::INT_ADD:
         doIntAdd();
@@ -133,46 +153,40 @@ StackElement ExecutionContext::interpret(const std::size_t functionIndex) {
         doIntDiv();
         break;
       case OpCode::INT_PUSH_CONSTANT:
-        doIntPushConstant(instructionPointer->immediate());
+        doIntPushConstant();
         break;
       case OpCode::INT_NOT:
         doIntNot();
         break;
       case OpCode::INT_JMP_EQ:
-        instructionPointer += doIntJmpEq(instructionPointer->immediate());
+        doIntJmpEq();
         break;
       case OpCode::INT_JMP_NEQ:
-        instructionPointer += doIntJmpNeq(instructionPointer->immediate());
+        doIntJmpNeq();
         break;
       case OpCode::INT_JMP_GT:
-        instructionPointer += doIntJmpGt(instructionPointer->immediate());
+        doIntJmpGt();
         break;
       case OpCode::INT_JMP_GE:
-        instructionPointer += doIntJmpGe(instructionPointer->immediate());
+        doIntJmpGe();
         break;
       case OpCode::INT_JMP_LT:
-        instructionPointer += doIntJmpLt(instructionPointer->immediate());
+        doIntJmpLt();
         break;
       case OpCode::INT_JMP_LE:
-        instructionPointer += doIntJmpLe(instructionPointer->immediate());
+        doIntJmpLe();
         break;
       case OpCode::STR_PUSH_CONSTANT:
-        doStrPushConstant(instructionPointer->immediate());
-        break;
-      case OpCode::STR_JMP_EQ:
-        // TODO
-        break;
-      case OpCode::STR_JMP_NEQ:
-        // TODO
+        doStrPushConstant();
         break;
       case OpCode::NEW_OBJECT:
         doNewObject();
         break;
       case OpCode::PUSH_FROM_OBJECT:
-        doPushFromObject(Om::Id(instructionPointer->immediate()));
+        doPushFromObject();
         break;
       case OpCode::POP_INTO_OBJECT:
-        doPopIntoObject(Om::Id(instructionPointer->immediate()));
+        doPopIntoObject();
         break;
       case OpCode::CALL_INDIRECT:
         doCallIndirect();
@@ -180,154 +194,235 @@ StackElement ExecutionContext::interpret(const std::size_t functionIndex) {
       case OpCode::SYSTEM_COLLECT:
         doSystemCollect();
         break;
+      case OpCode::END_SECTION:
+        continue_ = false;
+        break;
       default:
         assert(false);
         break;
     }
-    instructionPointer++;
-    programCounter_++;
+
+    if (cfg_->debug) {
+      backtrace(std::cerr) << std::endl;
+      // printStack(std::cerr, stack());
+    }
   }
-  throw std::runtime_error("Reached end of function");
 }
 
-void ExecutionContext::push(StackElement value) { stack_.push(value); }
+std::size_t FRAME_SIZE = sizeof(Om::Value) * 4;
 
-StackElement ExecutionContext::pop() { return stack_.pop(); }
+void ExecutionContext::enterCall(std::size_t target, CallerType type) {
+  const FunctionDef& callee = getFunction(target);
 
-void ExecutionContext::doFunctionCall(Immediate value) {
-  auto f = virtualMachine_->getFunction((std::size_t)value);
-  auto result = interpret(value);
-  push(result);
+  // reserve space for locals (args are already pushed)
+  stack_.pushn(callee.nregs);
+
+  // save caller's interpreter state.
+  stack_.push({Om::AS_UINT48, fn_});
+  stack_.push({Om::AS_PTR, ip_});
+  stack_.push({Om::AS_PTR, bp_});
+  stack_.push({Om::AS_UINT48, std::uint64_t(type)});
+
+  // set up state for callee
+  fn_ = target;
+  ip_ = callee.instructions.data();
+  bp_ = stack_.top();
 }
 
-void ExecutionContext::doFunctionReturn(StackElement returnVal) {
-  // TODO
+void ExecutionContext::exitCall() {
+  const FunctionDef& callee = getFunction(fn_);
+
+  // pop callee scratch space
+  stack_.restore(bp_);
+
+  // restore caller state. note IP is restored verbatim, not incremented.
+  CallerType type = CallerType(stack_.pop().getUint48());
+  bp_ = stack_.pop().getPtr<Om::Value>();
+  ip_ = stack_.pop().getPtr<Instruction>();
+  fn_ = stack_.pop().getUint48();
+
+  // pop parameters and locals
+  stack_.popn(callee.nargs + callee.nregs);
+
+  switch (type) {
+    case CallerType::INTERPRETER:
+      continue_ = true;
+      break;
+    case CallerType::OUTERMOST:
+      continue_ = false;
+      break;
+    case CallerType::COMPILED:
+      assert(0);
+      continue_ = false;
+      break;
+  }
 }
 
-void ExecutionContext::doPrimitiveCall(Immediate value) {
-  PrimitiveFunction *primitive = virtualMachine_->getPrimitive(value);
+void ExecutionContext::doFunctionCall() { enterCall(ip_->immediate()); }
+
+void ExecutionContext::doFunctionReturn() {
+  StackElement result = stack_.pop();
+  exitCall();
+  stack_.push(result);
+  ++ip_;
+}
+
+void ExecutionContext::doPrimitiveCall() {
+  Immediate index = ip_->immediate();
+  PrimitiveFunction* primitive = virtualMachine_->getPrimitive(index);
   (*primitive)(this);
+  ++ip_;
 }
 
-Immediate ExecutionContext::doJmp(Immediate offset) { return offset; }
+void ExecutionContext::doJmp() { ip_ += ip_->immediate() + 1; }
 
 void ExecutionContext::doDuplicate() {
-  push(stack_.peek());
+  stack_.push(stack_.peek());
+  ++ip_;
 }
 
-void ExecutionContext::doDrop() { stack_.pop(); }
-
-void ExecutionContext::doPushFromVar(StackElement *args, Immediate offset) {
-  stack_.push(args[offset]);
+void ExecutionContext::doDrop() {
+  stack_.pop();
+  ++ip_;
 }
 
-void ExecutionContext::doPushIntoVar(StackElement *args, Immediate offset) {
-  args[offset] = stack_.pop();
+void ExecutionContext::doPushFromVar() {
+  const FunctionDef& callee = getFunction(fn_);
+  Om::Value* args = bp_ - (4 + callee.nargs +
+                           callee.nregs);  // TODO: Improve variable indexing
+  Immediate index = ip_->immediate();
+  stack_.push(args[index]);
+  ++ip_;
+}
+
+void ExecutionContext::doPopIntoVar() {
+  const FunctionDef& callee = getFunction(fn_);
+  Om::Value* args = bp_ - (4 + callee.nargs +
+                           callee.nregs);  // TODO: Improve variable indexing
+  Immediate index = ip_->immediate();
+  args[index] = stack_.pop();
+  ++ip_;
 }
 
 void ExecutionContext::doIntAdd() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   push({Om::AS_INT48, left + right});
+  ++ip_;
 }
 
 void ExecutionContext::doIntSub() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   push({Om::AS_INT48, left - right});
+  ++ip_;
 }
 
 void ExecutionContext::doIntMul() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   push({Om::AS_INT48, left * right});
+  ++ip_;
 }
 
 void ExecutionContext::doIntDiv() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   push({Om::AS_INT48, left / right});
+  ++ip_;
 }
 
-void ExecutionContext::doIntPushConstant(Immediate value) {
-  stack_.push(StackElement().setInt48(value));
+void ExecutionContext::doIntPushConstant() {
+  stack_.push({Om::AS_INT48, ip_->immediate()});
+  ++ip_;
 }
 
 void ExecutionContext::doIntNot() {
   auto x = stack_.pop().getInt48();
   push({Om::AS_INT48, !x});
+  ++ip_;
 }
 
-Immediate ExecutionContext::doIntJmpEq(Immediate delta) {
+void ExecutionContext::doIntJmpEq() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   if (left == right) {
-    return delta;
+    ip_ += ip_->immediate() + 1;
+  } else {
+    ip_++;
   }
-  return 0;
 }
 
-Immediate ExecutionContext::doIntJmpNeq(Immediate delta) {
+void ExecutionContext::doIntJmpNeq() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   if (left != right) {
-    return delta;
+    ip_ += ip_->immediate() + 1;
+  } else {
+    ++ip_;
   }
-  return 0;
 }
 
-Immediate ExecutionContext::doIntJmpGt(Immediate delta) {
+void ExecutionContext::doIntJmpGt() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   if (left > right) {
-    return delta;
+    ip_ += ip_->immediate() + 1;
+  } else {
+    ++ip_;
   }
-  return 0;
 }
 
 // ( left right -- )
-Immediate ExecutionContext::doIntJmpGe(Immediate delta) {
+void ExecutionContext::doIntJmpGe() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   if (left >= right) {
-    return delta;
+    ip_ += ip_->immediate() + 1;
+  } else {
+    ++ip_;
   }
-  return 0;
 }
 
 // ( left right -- )
-Immediate ExecutionContext::doIntJmpLt(Immediate delta) {
-  auto right = stack_.pop().getInt48();
-  auto left = stack_.pop().getInt48();
+void ExecutionContext::doIntJmpLt() {
+  std::int32_t right = stack_.pop().getInt48();
+  std::int32_t left = stack_.pop().getInt48();
   if (left < right) {
-    return delta;
+    ip_ += ip_->immediate() + 1;
+  } else {
+    ++ip_;
   }
-  return 0;
 }
 
 // ( left right -- )
-Immediate ExecutionContext::doIntJmpLe(Immediate delta) {
+void ExecutionContext::doIntJmpLe() {
   auto right = stack_.pop().getInt48();
   auto left = stack_.pop().getInt48();
   if (left <= right) {
-    return delta;
+    ip_ += ip_->immediate() + 1;
+  } else {
+    ++ip_;
   }
-  return 0;
 }
 
 // ( -- string )
-void ExecutionContext::doStrPushConstant(Immediate param) {
-  stack_.push({Om::AS_INT48, param});
+void ExecutionContext::doStrPushConstant() {
+  stack_.push({Om::AS_INT48, ip_->immediate()});
+  ++ip_;
 }
 
 // ( -- object )
 void ExecutionContext::doNewObject() {
   auto ref = Om::allocateEmptyObject(*this);
-  stack_.push(Om::Value{Om::AS_REF, ref});
+  stack_.push({Om::AS_REF, ref});
+  ++ip_;
 }
 
 // ( object -- value )
-void ExecutionContext::doPushFromObject(Om::Id slotId) {
+void ExecutionContext::doPushFromObject() {
+  Om::Id slotId(ip_->immediate());
+
   auto value = stack_.pop();
   if (!value.isRef()) {
     throw std::runtime_error("Accessing non-object value as an object.");
@@ -342,10 +437,13 @@ void ExecutionContext::doPushFromObject(Om::Id slotId) {
   } else {
     throw std::runtime_error("Accessing an object's field that doesn't exist.");
   }
+  ++ip_;
 }
 
 // ( object value -- )
-void ExecutionContext::doPopIntoObject(Om::Id slotId) {
+void ExecutionContext::doPopIntoObject() {
+  Om::Id slotId(ip_->immediate());
+
   if (!stack_.peek().isRef()) {
     throw std::runtime_error("Accessing non-object as an object");
   }
@@ -371,15 +469,103 @@ void ExecutionContext::doPopIntoObject(Om::Id slotId) {
   auto val = pop();
   Om::setValue(*this, object, descriptor, val);
   // TODO: Write barrier the object on store.
+  ++ip_;
 }
 
 void ExecutionContext::doCallIndirect() {
   assert(0);  // TODO: Implement call indirect
+  ++ip_;
 }
 
 void ExecutionContext::doSystemCollect() {
   std::cout << "SYSTEM COLLECT!!!" << std::endl;
   OMR_GC_SystemCollect(omContext_.vmContext(), 0);
+  ++ip_;
+}
+
+/// prints (top, base]
+void printStackSegment(std::ostream& out, const Om::Value* top,
+                       const Om::Value* base) {
+  out << "\n    (stack";
+  for (const Om::Value* x = top - 1; x >= base; --x) {
+    out << "\n      " << *x;
+  }
+  out << ")";
+}
+
+void printLocals(std::ostream& out, const Om::Value* locals,
+                 std::size_t nlocals) {
+  out << "\n    (locals";
+  for (std::size_t i = 0; i < nlocals; ++i) {
+    out << "\n      "
+        << "(local " << i << " " << locals[i] << ")";
+  }
+  out << ")";
+}
+
+void printParams(std::ostream& out, const Om::Value* params,
+                 std::size_t nparams) {
+  out << "\n    (params";
+  for (std::size_t i = 0; i < nparams; ++i) {
+    out << "\n      "
+        << "(param " << i << " " << params[i] << ")";
+  }
+  out << ")";
+}
+
+std::ostream& ExecutionContext::backtrace(std::ostream& out) const {
+  out << "(backtrace";
+
+  // first frame:
+
+  std::size_t fn = fn_;
+  const Om::Value* bp = bp_;
+  const Instruction* ip = ip_;
+  const Om::Value* tp = stack().top();
+
+  std::size_t i = 0;
+
+  while (bp > stack().base()) {
+    printCall(out, i, fn, ip, tp, bp);
+
+    // next frame:
+
+    ++i;
+
+    const FunctionDef& callee = getFunction(fn);
+    const Om::Value* frame = bp;
+
+    bp = frame[-2].getPtr<Om::Value>();
+    ip = frame[-3].getPtr<const Instruction>();
+    fn = frame[-4].getUint48();
+    tp = frame - 4 - callee.nregs - callee.nargs;
+  };
+
+  out << ")";
+
+  return out;
+}
+
+void ExecutionContext::printCall(std::ostream& out, std::size_t i,
+                                 std::size_t fn, const Instruction* ip,
+                                 const Om::Value* tp, const Om::Value* bp) const {
+  const FunctionDef& callee = getFunction(fn);
+  std::size_t nlocals = callee.nregs;
+  std::size_t nparams = callee.nargs;
+
+  out << "\n  (frame " << i;
+  out << " (fn " << callee.name << " " << fn << ")";
+
+  printStackSegment(out, tp, bp);
+  printLocals(out, bp - 4 - nlocals, nlocals);
+  printParams(out, bp - 4 - nlocals - nparams, nparams);
+
+  out << ")";
+}
+
+std::ostream& printTrace(std::ostream& out, const b9::FunctionDef& function,
+                    const b9::Instruction* ip) {
+  return out << "(trace " << function.name << " " << ip << " " << *ip << ")";
 }
 
 }  // namespace b9
